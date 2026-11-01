@@ -134,6 +134,12 @@ type Config struct {
 	// properties; zero means the default.
 	RowGroupSizeBytes int64
 	RowGroupRowLimit  int64
+	// Bins compaction merges at once; each holds its inputs and output in
+	// memory. Below 1 means one at a time.
+	CompactConcurrency int64
+	// Stop compaction after planning and describe the bins instead. Set by
+	// the standalone runner, never from worker config.
+	CompactPlanOnly bool
 }
 
 // ParseConfig extracts an iceberg maintenance Config from plugin config values.
@@ -159,6 +165,7 @@ func ParseConfig(values map[string]*plugin_pb.ConfigValue) Config {
 		SortMaxInputBytes:           readSizeMBConfig(values, "sort_max_input_mb", 0),
 		SortBufferRows:              readInt64Config(values, "sort_buffer_rows", defaultSortBufferRows),
 		SortSpillDir:                strings.TrimSpace(readStringConfig(values, "sort_spill_dir", "")),
+		CompactConcurrency:          readInt64Config(values, "compact_concurrency", 1),
 	}
 
 	// Clamp the fields that are always defaulted by worker config parsing.

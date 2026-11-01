@@ -13,6 +13,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/apache/iceberg-go"
@@ -21,6 +22,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3tables"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -96,8 +98,12 @@ func (h *Handler) compactDataFiles(
 	schema := meta.CurrentSchema()
 
 	// Collect data file entries from data manifests
+	glog.V(1).Infof("iceberg compact %s/%s: reading %d data and %d delete manifests", bucketName, tablePath, len(dataManifests), len(deleteManifests))
 	var allEntries []iceberg.ManifestEntry
-	for _, mf := range dataManifests {
+	for mfIdx, mf := range dataManifests {
+		if mfIdx > 0 && mfIdx%100 == 0 {
+			glog.V(1).Infof("iceberg compact %s/%s: read %d/%d data manifests", bucketName, tablePath, mfIdx, len(dataManifests))
+		}
 		manifestData, err := loadFileByIcebergPath(ctx, filerClient, bucketName, dataPath, mf.FilePath())
 		if err != nil {
 			return "", nil, fmt.Errorf("read manifest %s: %w", mf.FilePath(), err)
@@ -176,6 +182,9 @@ func (h *Handler) compactDataFiles(
 		}
 	}
 
+	glog.V(1).Infof("iceberg compact %s/%s: %d data files, %d delete files, %d files with position deletes, %d equality delete groups",
+		bucketName, tablePath, len(allEntries), len(allDeleteEntries), len(positionDeletes), len(eqDeleteGroups))
+
 	candidateEntries, err := excludeDeletionVectorFiles(allEntries, dvPaths, bucketName, dataPath)
 	if err != nil {
 		return "", nil, err
@@ -212,6 +221,20 @@ func (h *Handler) compactDataFiles(
 	bins = filterCompactionBinsByPlan(bins, config, rewritePlan)
 	if len(bins) == 0 {
 		return compactionNoEligibleMessage(config, rewritePlan, initialBinCount), nil, nil
+	}
+	if glog.V(1) {
+		var plannedFiles int
+		var plannedBytes int64
+		for _, bin := range bins {
+			plannedFiles += len(bin.Entries)
+			plannedBytes += bin.TotalSize
+		}
+		glog.Infof("iceberg compact %s/%s: planned %d bins from %d candidate files: %d files, %.1fMB to rewrite (target %dMB, strategy %s, where %q)",
+			bucketName, tablePath, len(bins), len(candidateEntries), plannedFiles, float64(plannedBytes)/(1024*1024),
+			targetSize/(1024*1024), rewritePlan.summaryLabel(), config.Where)
+	}
+	if config.CompactPlanOnly {
+		return describeCompactionPlan(bins, specsByID), map[string]int64{MetricBins: int64(len(bins))}, nil
 	}
 
 	// Build a lookup from spec ID to PartitionSpec for per-bin manifest writing.
@@ -278,18 +301,24 @@ func (h *Handler) compactDataFiles(
 		}
 	}()
 
-	for binIdx, bin := range bins {
-		select {
-		case <-ctx.Done():
-			return "", nil, ctx.Err()
-		default:
-		}
+	// Bins don't depend on each other until the commit, so up to
+	// CompactConcurrency of them merge and upload at once. Results are applied
+	// in bin order below, so the commit matches a sequential run.
+	if err := ensureFilerDir(ctx, filerClient, dataDir); err != nil {
+		return "", nil, fmt.Errorf("ensure data dir: %w", err)
+	}
 
+	var artifactsMu sync.Mutex
+	// compactBin merges one bin and uploads the result. A nil file with no error
+	// skips the bin; an error fails the whole compaction.
+	compactBin := func(ctx context.Context, binIdx int, bin compactionBin) (iceberg.DataFile, error) {
 		mergedFileName := fmt.Sprintf("compact-%d-%d-%s-%d.parquet", snapshotID, newSnapID, artifactSuffix, binIdx)
 		mergedFilePath := absoluteIcebergPath(bucketName, dataPath, "data", mergedFileName)
+		glog.V(1).Infof("iceberg compact %s/%s: bin %d/%d started: %d files, %.1fMB", bucketName, tablePath, binIdx+1, len(bins), len(bin.Entries), float64(bin.TotalSize)/(1024*1024))
 
 		var mergedData []byte
 		var recordCount int64
+		var err error
 		rowGroupRows := rowsPerRowGroup(bin, config)
 		if rewritePlan != nil && rewritePlan.strategy == "sort" {
 			mergedData, recordCount, err = mergeParquetFilesSorted(ctx, filerClient, bucketName, dataPath, bin.Entries, positionDeletes, eqDeleteGroups, schema, rewritePlan, rowGroupRows, lineage)
@@ -298,7 +327,7 @@ func (h *Handler) compactDataFiles(
 		}
 		if err != nil {
 			glog.Warningf("iceberg compact: failed to merge bin %d (%d files): %v", binIdx, len(bin.Entries), err)
-			goto binDone
+			return nil, nil
 		}
 		// A default-CRS geometry column declares no CRS (geometry_crs.go). A
 		// footer that cannot be rewritten leaves the file as written: valid,
@@ -310,91 +339,118 @@ func (h *Handler) compactDataFiles(
 		}
 
 		// Write merged file to filer
-		if err := ensureFilerDir(ctx, filerClient, dataDir); err != nil {
-			return "", nil, fmt.Errorf("ensure data dir: %w", err)
-		}
 		if err := saveFilerFile(ctx, filerClient, dataDir, mergedFileName, mergedData); err != nil {
-			return "", nil, fmt.Errorf("save merged file: %w", err)
+			return nil, fmt.Errorf("save merged file: %w", err)
 		}
 
 		// Use the partition spec matching this bin's spec ID
-		{
-			binSpec, ok := specLookup[int(bin.SpecID)]
-			if !ok {
-				glog.Warningf("iceberg compact: spec %d not found for bin %d, skipping", bin.SpecID, binIdx)
-				_ = deleteFilerFile(ctx, filerClient, dataDir, mergedFileName)
-				goto binDone
-			}
+		binSpec, ok := specLookup[int(bin.SpecID)]
+		if !ok {
+			glog.Warningf("iceberg compact: spec %d not found for bin %d, skipping", bin.SpecID, binIdx)
+			_ = deleteFilerFile(ctx, filerClient, dataDir, mergedFileName)
+			return nil, nil
+		}
 
-			// Create new DataFile entry for the merged file
-			dfBuilder, err := iceberg.NewDataFileBuilder(
-				binSpec,
-				iceberg.EntryContentData,
-				mergedFilePath,
-				iceberg.ParquetFile,
-				bin.Partition,
-				nil, nil,
-				recordCount,
-				int64(len(mergedData)),
-			)
+		// Create new DataFile entry for the merged file
+		dfBuilder, err := iceberg.NewDataFileBuilder(
+			binSpec,
+			iceberg.EntryContentData,
+			mergedFilePath,
+			iceberg.ParquetFile,
+			bin.Partition,
+			nil, nil,
+			recordCount,
+			int64(len(mergedData)),
+		)
+		if err != nil {
+			glog.Warningf("iceberg compact: failed to build data file entry for bin %d: %v", binIdx, err)
+			_ = deleteFilerFile(ctx, filerClient, dataDir, mergedFileName)
+			return nil, nil
+		}
+		artifactsMu.Lock()
+		writtenArtifacts = append(writtenArtifacts, artifact{dir: dataDir, fileName: mergedFileName})
+		artifactsMu.Unlock()
+
+		// Record the column statistics readers prune files by; without
+		// them every scan has to read every compacted file.
+		if stats, statsErr := collectColumnStats(mergedData, schema); statsErr != nil {
+			glog.Warningf("iceberg compact: no column statistics for %s: %v", mergedFileName, statsErr)
+		} else {
+			stats.applyTo(dfBuilder)
+		}
+
+		// A merged file keeps its rows' row IDs, so its entry names the first
+		// materialized one instead of inheriting a fresh range at commit.
+		if lineage {
+			firstID, err := mergedFileFirstRowID(mergedData)
 			if err != nil {
-				glog.Warningf("iceberg compact: failed to build data file entry for bin %d: %v", binIdx, err)
+				glog.Warningf("iceberg compact: failed to read merged file lineage for bin %d: %v", binIdx, err)
 				_ = deleteFilerFile(ctx, filerClient, dataDir, mergedFileName)
-				goto binDone
+				return nil, nil
 			}
-			writtenArtifacts = append(writtenArtifacts, artifact{dir: dataDir, fileName: mergedFileName})
-
-			// Record the column statistics readers prune files by; without
-			// them every scan has to read every compacted file.
-			if stats, statsErr := collectColumnStats(mergedData, schema); statsErr != nil {
-				glog.Warningf("iceberg compact: no column statistics for %s: %v", mergedFileName, statsErr)
-			} else {
-				stats.applyTo(dfBuilder)
+			if firstID != nil {
+				dfBuilder.FirstRowID(*firstID)
 			}
+		}
 
-			// A merged file keeps its rows' row IDs, so its entry names the first
-			// materialized one instead of inheriting a fresh range at commit.
-			if lineage {
-				firstID, err := mergedFileFirstRowID(mergedData)
-				if err != nil {
-					glog.Warningf("iceberg compact: failed to read merged file lineage for bin %d: %v", binIdx, err)
-					_ = deleteFilerFile(ctx, filerClient, dataDir, mergedFileName)
-					goto binDone
-				}
-				if firstID != nil {
-					dfBuilder.FirstRowID(*firstID)
-				}
+		return dfBuilder.Build(), nil
+	}
+
+	mergedFiles := make([]iceberg.DataFile, len(bins))
+	var progressMu sync.Mutex
+	binsDone := 0
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(compactionConcurrency(config))
+	for binIdx, bin := range bins {
+		group.Go(func() error {
+			if err := groupCtx.Err(); err != nil {
+				return err
 			}
+			mergedFile, err := compactBin(groupCtx, binIdx, bin)
+			if err != nil {
+				return err
+			}
+			mergedFiles[binIdx] = mergedFile
+			if onProgress != nil {
+				progressMu.Lock()
+				onProgress(binsDone, len(bins))
+				binsDone++
+				progressMu.Unlock()
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return "", nil, err
+	}
 
-			mergedDataFile := dfBuilder.Build()
-			summary.addFile(mergedDataFile)
-			newEntry := iceberg.NewManifestEntry(
-				iceberg.EntryStatusADDED,
+	for binIdx, mergedDataFile := range mergedFiles {
+		if mergedDataFile == nil {
+			continue
+		}
+		bin := bins[binIdx]
+		summary.addFile(mergedDataFile)
+		newEntry := iceberg.NewManifestEntry(
+			iceberg.EntryStatusADDED,
+			&newSnapID,
+			nil, nil,
+			mergedDataFile,
+		)
+		newManifestEntries = append(newManifestEntries, newEntry)
+
+		// Mark original entries as deleted
+		for _, entry := range bin.Entries {
+			summary.removeFile(entry.DataFile())
+			delEntry := iceberg.NewManifestEntry(
+				iceberg.EntryStatusDELETED,
 				&newSnapID,
-				nil, nil,
-				mergedDataFile,
+				entrySeqNum(entry), entryFileSeqNum(entry),
+				entry.DataFile(),
 			)
-			newManifestEntries = append(newManifestEntries, newEntry)
-
-			// Mark original entries as deleted
-			for _, entry := range bin.Entries {
-				summary.removeFile(entry.DataFile())
-				delEntry := iceberg.NewManifestEntry(
-					iceberg.EntryStatusDELETED,
-					&newSnapID,
-					entrySeqNum(entry), entryFileSeqNum(entry),
-					entry.DataFile(),
-				)
-				deletedManifestEntries = append(deletedManifestEntries, delEntry)
-			}
-
-			totalMerged += len(bin.Entries)
+			deletedManifestEntries = append(deletedManifestEntries, delEntry)
 		}
 
-	binDone:
-		if onProgress != nil {
-			onProgress(binIdx, len(bins))
-		}
+		totalMerged += len(bin.Entries)
 	}
 
 	if len(newManifestEntries) == 0 {
@@ -575,6 +631,46 @@ func (h *Handler) compactDataFiles(
 		result = fmt.Sprintf("%s using %s", result, rewritePlan.summaryLabel())
 	}
 	return result, metrics, nil
+}
+
+func compactionConcurrency(config Config) int {
+	if config.CompactConcurrency < 1 {
+		return 1
+	}
+	return int(config.CompactConcurrency)
+}
+
+// describeCompactionPlan lists each bin's partition, written so it can be
+// pasted into a where filter, with its file count and size.
+func describeCompactionPlan(bins []compactionBin, specsByID map[int]iceberg.PartitionSpec) string {
+	var out strings.Builder
+	var totalFiles int
+	var totalBytes int64
+	for binIdx, bin := range bins {
+		var clauses []string
+		if spec, ok := specsByID[int(bin.SpecID)]; ok {
+			for _, field := range spec.Fields() {
+				value, ok := bin.Partition[field.FieldID]
+				if !ok {
+					continue
+				}
+				if str, isString := value.(string); isString {
+					clauses = append(clauses, fmt.Sprintf("%s = '%s'", field.Name, str))
+				} else {
+					clauses = append(clauses, fmt.Sprintf("%s = %v", field.Name, value))
+				}
+			}
+		}
+		partition := strings.Join(clauses, " AND ")
+		if partition == "" {
+			partition = "(unpartitioned)"
+		}
+		fmt.Fprintf(&out, "bin %d: %s  files=%d size=%.1fMB\n", binIdx, partition, len(bin.Entries), float64(bin.TotalSize)/(1024*1024))
+		totalFiles += len(bin.Entries)
+		totalBytes += bin.TotalSize
+	}
+	fmt.Fprintf(&out, "%d bins, %d files, %.1fMB to rewrite", len(bins), totalFiles, float64(totalBytes)/(1024*1024))
+	return out.String()
 }
 
 // buildCompactionBins groups small data files by partition for bin-packing.
