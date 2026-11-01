@@ -1,5 +1,7 @@
-// iceberg-compact runs the iceberg_maintenance worker's data compaction on one
-// table, outside the admin scheduler, with bins merged in parallel.
+// iceberg-compact runs the iceberg_maintenance worker's operations on one
+// table, outside the admin scheduler, with compaction bins merged in parallel.
+// Operations run in the worker's order: compact, rewrite_position_delete_files,
+// expire_snapshots, remove_orphans, rewrite_manifests.
 //
 // Export the settings saved in the admin UI so the run matches them:
 //
@@ -10,8 +12,12 @@
 //	iceberg-compact -filer=<filer>:8888 -config=config.json -bucket=b -namespace=ns -table=t -where="day = 20390" -plan
 //	iceberg-compact -filer=<filer>:8888 -config=config.json -bucket=b -namespace=ns -table=t -where="day = 20390" -concurrency=8
 //
-// Stop the scheduled worker from compacting the same table while this runs:
-// any other commit to the table makes the compaction fail as a stale plan.
+// where only works with compact, rewrite_position_delete_files and
+// rewrite_manifests, so compact partitions with -operations=compact, then run
+// the rest table-wide with -where= -operations=expire_snapshots,...
+//
+// Stop the scheduled worker from running on the same table while this runs:
+// any other commit to the table makes these operations fail as a stale plan.
 package main
 
 import (
@@ -53,10 +59,11 @@ func main() {
 	bucket := flag.String("bucket", "", "table bucket name")
 	namespace := flag.String("namespace", "", "table namespace")
 	tableName := flag.String("table", "", "table name")
-	where := flag.String("where", "", "partitions to compact, e.g. \"day = 20390\" or \"day IN (20390, 20391) AND region = 'eu'\"; overrides the config's where")
+	where := flag.String("where", "", "partitions to compact, e.g. \"day = 20390\" or \"day IN (20390, 20391) AND region = 'eu'\"; overrides the config's where, -where= clears it")
+	operations := flag.String("operations", "", "operations to run, e.g. \"compact\" or \"expire_snapshots,rewrite_manifests\" or \"all\"; overrides the config's operations")
 	configFile := flag.String("config", "", "JSON from GET /api/plugin/job-types/iceberg_maintenance/config; its worker settings are used as the base")
 	concurrency := flag.Int("concurrency", 1, "bins merged at once; each holds its input files and output in memory")
-	plan := flag.Bool("plan", false, "only list the bins (partition, files, size) that would be compacted, then exit")
+	plan := flag.Bool("plan", false, "only list the bins (partition, files, size) compaction would merge, then exit; runs no other operation")
 	timeout := flag.Duration("timeout", 0, "give up after this long, 0 for no limit")
 	securitySection := flag.String("securitySection", "grpc.client", "security.toml section for gRPC client TLS")
 	overrides := setFlags{}
@@ -83,8 +90,16 @@ func main() {
 		}
 		values[key] = &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_StringValue{StringValue: value}}
 	}
-	if *where != "" {
+	setFlagNames := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { setFlagNames[f.Name] = true })
+	if setFlagNames["where"] {
 		values["where"] = &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_StringValue{StringValue: *where}}
+	}
+	if setFlagNames["operations"] {
+		values["operations"] = &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_StringValue{StringValue: *operations}}
+	}
+	if *plan {
+		values["operations"] = &plugin_pb.ConfigValue{Kind: &plugin_pb.ConfigValue_StringValue{StringValue: "compact"}}
 	}
 	config := iceberg.ParseConfig(values)
 	config.CompactConcurrency = int64(*concurrency)
@@ -110,17 +125,37 @@ func main() {
 
 	tablePath := path.Join(*namespace, *tableName)
 	start := time.Now()
-	result, metrics, err := handler.CompactTable(ctx, client, *bucket, tablePath, config, printConfig, func(binIdx, totalBins int) {
-		fmt.Fprintf(os.Stderr, "[%s] bin %d/%d done\n", time.Since(start).Round(time.Second), binIdx+1, totalBins)
+	var opStart time.Time
+	err = handler.RunMaintenance(ctx, client, *bucket, tablePath, config, iceberg.MaintenanceHooks{
+		OnResolved: func(c iceberg.Config, ops []string) {
+			printConfig(c, ops)
+			if len(ops) == 0 {
+				fmt.Println("all requested operations are disabled in this table's maintenance configuration")
+			}
+		},
+		OnOpStart: func(op string) {
+			opStart = time.Now()
+			fmt.Fprintf(os.Stderr, "[%s] %s started\n", time.Since(start).Round(time.Second), op)
+		},
+		OnOpDone: func(op, result string, metrics map[string]int64, opErr error) {
+			took := time.Since(opStart).Round(time.Second)
+			if opErr != nil {
+				fmt.Printf("%s: error after %s: %v\n", op, took, opErr)
+				return
+			}
+			fmt.Printf("%s: %s (took %s)\n", op, result, took)
+			for _, key := range sortedKeys(metrics) {
+				fmt.Printf("  %s=%d\n", key, metrics[key])
+			}
+		},
+		OnBinDone: func(binIdx, totalBins int) {
+			fmt.Fprintf(os.Stderr, "[%s] bin %d/%d done\n", time.Since(start).Round(time.Second), binIdx+1, totalBins)
+		},
 	})
-	if err != nil {
-		fatalf("compact %s/%s: %v", *bucket, tablePath, err)
-	}
-	fmt.Println(result)
-	for _, key := range sortedKeys(metrics) {
-		fmt.Printf("  %s=%d\n", key, metrics[key])
-	}
 	fmt.Printf("took %s\n", time.Since(start).Round(time.Second))
+	if err != nil {
+		fatalf("maintenance on %s/%s failed: %v", *bucket, tablePath, err)
+	}
 }
 
 // loadWorkerConfigValues reads the worker settings out of the admin's saved
@@ -154,11 +189,15 @@ func knownWorkerConfigKeys() map[string]struct{} {
 	return known
 }
 
-func printConfig(c iceberg.Config) {
+func printConfig(c iceberg.Config, ops []string) {
 	mb := func(b int64) string { return fmt.Sprintf("%dMB", b/(1024*1024)) }
-	fmt.Fprintf(os.Stderr, "settings after table properties (planning now): target_file=%s min_input_files=%d apply_deletes=%v strategy=%q where=%q row_group_bytes=%d row_group_rows=%d concurrency=%d\n",
+	fmt.Fprintf(os.Stderr, "operations: %s\n", strings.Join(ops, ", "))
+	fmt.Fprintf(os.Stderr, "settings after table properties: target_file=%s min_input_files=%d apply_deletes=%v strategy=%q where=%q row_group_bytes=%d row_group_rows=%d concurrency=%d\n",
 		mb(c.TargetFileSizeBytes), c.MinInputFiles, c.ApplyDeletes, c.RewriteStrategy, c.Where,
 		c.RowGroupSizeBytes, c.RowGroupRowLimit, c.CompactConcurrency)
+	fmt.Fprintf(os.Stderr, "  snapshots: keep=%d retention=%dh  orphans: older_than=%dh  manifests: min_to_rewrite=%d  deletes: target=%s min_input_files=%d\n",
+		c.MaxSnapshotsToKeep, c.SnapshotRetentionMs/int64(time.Hour/time.Millisecond), c.OrphanOlderThanHours,
+		c.MinManifestsToRewrite, mb(c.DeleteTargetFileSizeBytes), c.DeleteMinInputFiles)
 }
 
 func sortedKeys[V any](m map[string]V) []string {
